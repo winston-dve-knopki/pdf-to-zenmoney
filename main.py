@@ -1,4 +1,5 @@
 import typing as tp
+import csv
 import PyPDF2
 import re
 import requests
@@ -8,7 +9,7 @@ import click
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 def pdf_to_text(file_path: str) -> str:
     with open(file_path, "rb") as file:
@@ -515,6 +516,102 @@ def delete_transactions(
         raise Exception(f"Ошибка удаления транзакций: {response.status_code} - {response.text}")
 
 
+def export_transactions_to_csv(
+    access_token: str,
+    output_path: str,
+    account_title: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> int:
+    """
+    Скачивает все транзакции из ZenMoney и сохраняет в CSV для анализа.
+
+    Args:
+        access_token: OAuth токен доступа
+        output_path: Путь к выходному CSV файлу
+        account_title: Если указано — только транзакции этого счета
+        start_date: Начальная дата YYYY-MM-DD (включительно)
+        end_date: Конечная дата YYYY-MM-DD (включительно)
+
+    Returns:
+        Количество сохранённых транзакций
+    """
+    zenmoney_data = get_zenmoney_data(access_token)
+    transactions = zenmoney_data.get('transaction', [])
+    accounts = zenmoney_data.get('account', [])
+    instruments = zenmoney_data.get('instrument', [])
+    tags_entities = zenmoney_data.get('tag', [])
+
+    account_id_to_title = {acc['id']: acc.get('title', '') for acc in accounts if not acc.get('deleted', False)}
+    instrument_id_to_currency = {}
+    for inst in instruments:
+        instrument_id_to_currency[inst['id']] = inst.get('shortTitle') or inst.get('title', '')
+    tag_id_to_title = {t['id']: t.get('title', '') for t in tags_entities if not t.get('deleted', False)}
+
+    rows = []
+    for txn in transactions:
+        if txn.get('deleted', False):
+            continue
+
+        txn_date = txn.get('date', '')
+        if start_date and txn_date < start_date:
+            continue
+        if end_date and txn_date > end_date:
+            continue
+
+        income_account_id = txn.get('incomeAccount')
+        outcome_account_id = txn.get('outcomeAccount')
+        if account_title:
+            income_ok = account_id_to_title.get(income_account_id) == account_title
+            outcome_ok = account_id_to_title.get(outcome_account_id) == account_title
+            if not (income_ok or outcome_ok):
+                continue
+
+        # API ZenMoney отдаёт income/outcome в единицах валюты (рубли, доллары), не в копейках
+        income_val = float(txn.get('income') or 0)
+        outcome_val = float(txn.get('outcome') or 0)
+        amount_val = income_val - outcome_val
+        income_rub = round(income_val, 2)
+        outcome_rub = round(outcome_val, 2)
+        amount_rub = round(amount_val, 2)
+
+        tag_ids = txn.get('tag', []) or []
+        categories = ', '.join(tag_id_to_title.get(tid, str(tid)) for tid in tag_ids)
+
+        income_account = account_id_to_title.get(income_account_id, '')
+        outcome_account = account_id_to_title.get(outcome_account_id, '')
+        account = income_account or outcome_account
+
+        income_inst = txn.get('incomeInstrument')
+        outcome_inst = txn.get('outcomeInstrument')
+        inst_id = income_inst or outcome_inst
+        currency = instrument_id_to_currency.get(inst_id, '')
+
+        rows.append({
+            'date': txn_date,
+            'income': income_rub,
+            'outcome': outcome_rub,
+            'amount': amount_rub,
+            'currency': currency,
+            'comment': (txn.get('comment') or '').replace('\n', ' '),
+            'payee': (txn.get('payee') or '').replace('\n', ' '),
+            'category': categories,
+            'account': account,
+            'id': txn.get('id', ''),
+        })
+
+    if not rows:
+        return 0
+
+    fieldnames = ['date', 'income', 'outcome', 'amount', 'currency', 'comment', 'payee', 'category', 'account', 'id']
+    with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=';')
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return len(rows)
+
+
 @click.group()
 @click.option('--token', default=None, help='ZenMoney API токен (можно указать через переменную окружения ZEN_TOKEN)')
 @click.pass_context
@@ -571,8 +668,9 @@ def import_transactions(ctx, pdf_file, account, dry_run):
     if dry_run:
         click.echo("\n=== ПРЕДПРОСМОТР ТРАНЗАКЦИЙ (dry-run) ===")
         for i, txn in enumerate(zenmoney_transactions[:10], 1):
+            amt = txn['income'] or txn['outcome']
             click.echo(f"{i}. {txn['date']} | {txn['comment'][:50]} | "
-                      f"{'+' if txn['income'] > 0 else '-'}{abs(txn['income'] or txn['outcome'])/100:.2f} руб")
+                      f"{'+' if txn['income'] > 0 else '-'}{abs(amt):.2f} руб")
         if len(zenmoney_transactions) > 10:
             click.echo(f"... и еще {len(zenmoney_transactions) - 10} транзакций")
         click.echo("\nДля отправки запустите без флага --dry-run")
@@ -648,6 +746,30 @@ def list_accounts(ctx):
                 inst_id = acc.get('instrument')
                 currency = next((inst.get('shortTitle', '?') for inst in instruments if inst.get('id') == inst_id), '?')
                 click.echo(f"{acc.get('title', 'N/A'):<30} {acc.get('id', 'N/A'):<40} {currency:<10} {'Нет'}")
+    except Exception as e:
+        click.echo(f"✗ Ошибка: {e}", err=True)
+        raise click.Abort()
+
+
+@cli.command('export')
+@click.option('--output', '-o', 'output_path', required=True, type=click.Path(path_type=Path), help='Путь к выходному CSV файлу')
+@click.option('--account', help='Только транзакции этого счета (название счета)')
+@click.option('--start-date', help='Начальная дата YYYY-MM-DD')
+@click.option('--end-date', help='Конечная дата YYYY-MM-DD')
+@click.pass_context
+def export_cmd(ctx, output_path, account, start_date, end_date):
+    """Скачать все транзакции из ZenMoney и сохранить в CSV для анализа."""
+    token = ctx.obj['token']
+    click.echo("Загружаю транзакции из ZenMoney...")
+    try:
+        count = export_transactions_to_csv(
+            token,
+            str(output_path),
+            account_title=account,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        click.echo(f"✓ Сохранено {count} транзакций в {output_path}")
     except Exception as e:
         click.echo(f"✗ Ошибка: {e}", err=True)
         raise click.Abort()
